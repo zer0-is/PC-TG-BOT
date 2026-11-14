@@ -1,0 +1,23 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local Python and editor state
+.venv/
+__pycache__/
+*.py[cod]
+.vscode/
+
+# Build output, temporary files, and logs
+build/
+dist/
+*.spec
+*.log
+logs/
+**/logs/
+*.tmp
+*.bak
+
+# Legacy per-machine startup helper
+autostart_on.bat
