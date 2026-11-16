@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -35,7 +36,53 @@ ENV_DEFAULTS = {
     "ALLOW_SHELL": "false",
     "ALLOW_FILES": "false",
     "POWER_DELAY": "25",
+    # Ключ подписи кнопок. Пусто — бот выводит его из токена.
+    "SIGNING_KEY": "",
+    # Сколько команд в минуту разрешено одному пользователю.
+    "RATE_LIMIT": "20",
 }
+
+# Файл-блокировка: две копии панели означают двух ботов с одним токеном,
+# а Telegram такие запросы отклоняет ("terminated by other getUpdates").
+LOCK_FILE = Path(tempfile.gettempdir()) / (
+    "pcbot-panel-" + hashlib.sha256(str(APP_DIR).encode("utf-8")).hexdigest()[:8] + ".lock"
+)
+
+
+class SingleInstance:
+    """Гарантирует, что панель работает в единственном экземпляре."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+
+    def acquire(self) -> bool:
+        """Забирает блокировку. False — панель уже запущена."""
+        if os.name != "nt":
+            return True
+        try:
+            import msvcrt
+        except ImportError:
+            return True
+        handle = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.path, "a+b")
+            handle.seek(0)
+            handle.write(b"0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(os.getpid()).encode("ascii"))
+            handle.flush()
+            self._handle = handle
+            return True
+        except OSError:
+            if handle is not None:
+                handle.close()
+            return False
 
 
 def read_env_values(path: Path) -> dict[str, str]:
@@ -137,7 +184,6 @@ class ControlPanel:
         self.root.geometry("980x720")
         self.root.resizable(False, False)
         self.root.configure(fg_color="#292929")
-        self.root.attributes("-alpha", 0.84)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
         self.commands: queue.Queue[str] = queue.Queue()
@@ -621,14 +667,53 @@ class ControlPanel:
         ).grid(row=3, column=1, sticky="w", padx=(0, 18), pady=5)
         ctk.CTkLabel(
             advanced,
+            text="Лимит команд в минуту",
+            text_color="#E4E4E4",
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="w", padx=(18, 14), pady=5)
+        ctk.CTkEntry(
+            advanced,
+            textvariable=self.env_vars["RATE_LIMIT"],
+            fg_color="#202020",
+            border_color="#686868",
+            text_color="#F1F1F1",
+            corner_radius=15,
+            height=34,
+            width=130,
+            font=("Segoe UI", 10),
+        ).grid(row=4, column=1, sticky="w", padx=(0, 18), pady=5)
+        ctk.CTkLabel(
+            advanced,
+            text="Ключ подписи кнопок",
+            text_color="#E4E4E4",
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).grid(row=5, column=0, sticky="w", padx=(18, 14), pady=5)
+        signing_entry = ctk.CTkEntry(
+            advanced,
+            textvariable=self.env_vars["SIGNING_KEY"],
+            fg_color="#202020",
+            border_color="#686868",
+            text_color="#F1F1F1",
+            corner_radius=15,
+            height=34,
+            font=("Segoe UI", 10),
+        )
+        signing_entry.grid(row=5, column=1, sticky="ew", padx=(0, 18), pady=5)
+        self.secret_entries.append(signing_entry)
+        ctk.CTkLabel(
+            advanced,
             text="Команды и доступ к файлам дают боту расширенный доступ к компьютеру. "
-            "Оставляй их выключенными, если они не нужны.",
+            "Оставляй их выключенными, если они не нужны. "
+            "Ключ подписи защищает кнопки от подделки — если оставить поле пустым, "
+            "бот выведет его из токена.",
             text_color="#C5C5C5",
             font=("Segoe UI", 9),
             wraplength=780,
             justify="left",
             anchor="w",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=18, pady=(7, 13))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=18, pady=(7, 13))
 
         actions = ctk.CTkFrame(
             self.settings_content, fg_color="transparent", corner_radius=0
@@ -740,6 +825,14 @@ class ControlPanel:
                 parent=self.root,
             )
             return
+        rate_text = self.env_vars["RATE_LIMIT"].get().strip()
+        if not rate_text.isdecimal() or int(rate_text) < 1:
+            messagebox.showerror(
+                "Настройки",
+                "Лимит команд должен быть положительным целым числом.",
+                parent=self.root,
+            )
+            return
 
         values = {
             "BOT_TOKEN": token,
@@ -749,6 +842,8 @@ class ControlPanel:
             "ALLOW_SHELL": str(self.allow_shell.get()).lower(),
             "ALLOW_FILES": str(self.allow_files.get()).lower(),
             "POWER_DELAY": delay_text,
+            "SIGNING_KEY": self.env_vars["SIGNING_KEY"].get().strip(),
+            "RATE_LIMIT": rate_text,
         }
         try:
             write_env_values(ENV_FILE, values)
@@ -1067,4 +1162,16 @@ class ControlPanel:
 if __name__ == "__main__":
     if "--bot" in sys.argv:
         raise SystemExit(run_bot_worker())
+    instance = SingleInstance(LOCK_FILE)
+    if not instance.acquire():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "PC Bot",
+            "Панель управления уже запущена.\n"
+            "Посмотри значок в системном трее.",
+            parent=root,
+        )
+        root.destroy()
+        raise SystemExit(0)
     ControlPanel(auto_start="--autostart" in sys.argv).run()

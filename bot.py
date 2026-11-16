@@ -5,11 +5,15 @@
 """
 import asyncio
 import ctypes
+import hashlib
+import hmac
 import html
 import logging
+import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -54,6 +58,23 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL", "inclusionai/ling-3.2-flash:free"
 ).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    """Читает целое из окружения, молча возвращая значение по умолчанию."""
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw.isdecimal() else default
+
+
+# Ключ подписи callback_data. Если не задан — выводится из токена бота,
+# поэтому остаётся стабильным между перезапусками и старые кнопки в чате
+# продолжают работать.
+SIGNING_KEY = os.getenv("SIGNING_KEY", "").strip() or hashlib.sha256(
+    f"pcbot-callback::{TOKEN}".encode("utf-8")
+).hexdigest()
+
+RATE_LIMIT = _env_int("RATE_LIMIT", 20)  # команд в минуту на пользователя
+ACTION_LOG_LIMIT = _env_int("ACTION_LOG_LIMIT", 300)  # строк в журнале действий
 
 if not TOKEN or not ALLOWED:
     sys.exit("Заполни BOT_TOKEN и ALLOWED_USER_IDS в файле .env (см. .env.example)")
@@ -118,12 +139,150 @@ dp.message.outer_middleware(WhitelistMiddleware())
 dp.callback_query.outer_middleware(WhitelistMiddleware())
 
 
+# ---------------------------------------------------------------- безопасность
+
+
+def sign_data(data: str) -> str:
+    """Подписывает callback_data, чтобы кнопку нельзя было подделать."""
+    digest = hmac.new(
+        SIGNING_KEY.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:16]
+    return f"{data}|{digest}"
+
+
+def unsign_data(payload: str) -> str | None:
+    """Возвращает исходные данные, если подпись верна, иначе None."""
+    data, separator, digest = payload.rpartition("|")
+    if not separator:
+        return None
+    expected = hmac.new(
+        SIGNING_KEY.encode("utf-8"), data.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:16]
+    if not hmac.compare_digest(digest, expected):
+        return None
+    return data
+
+
+async def reject(event, text: str) -> None:
+    """Отвечает пользователю, не различая сообщение и нажатие кнопки."""
+    if isinstance(event, CallbackQuery):
+        await event.answer(text, show_alert=True)
+    else:
+        await event.answer(text)
+
+
+class CallbackSignerMiddleware(BaseMiddleware):
+    """Проверяет подпись callback_data и подменяет её исходным значением."""
+
+    async def __call__(self, handler, event, data):
+        unsigned = unsign_data(event.data)
+        if unsigned is None:
+            log.warning("Отклонён callback без верной подписи: %s", event.data[:64])
+            await reject(event, "Кнопка устарела или подделана. Открой меню заново.")
+            return None
+        # CallbackQuery в aiogram — неизменяемая модель (frozen), поэтому
+        # подменяем значение в обход pydantic-валидации.
+        object.__setattr__(event, "data", unsigned)
+        return await handler(event, data)
+
+
+class RateLimitMiddleware(BaseMiddleware):
+    """Ограничивает количество запросов от одного пользователя."""
+
+    def __init__(self, limit: int, window: int = 60):
+        self.limit = max(1, limit)
+        self.window = window
+        self._buckets: dict[int, list[float]] = {}
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            now = time.monotonic()
+            cutoff = now - self.window
+            bucket = [stamp for stamp in self._buckets.get(user.id, []) if stamp > cutoff]
+            if len(bucket) >= self.limit:
+                log.warning("Сработал лимит запросов для id=%s", user.id)
+                await reject(event, "Слишком много запросов. Подожди минуту.")
+                return None
+            bucket.append(now)
+            self._buckets[user.id] = bucket
+        return await handler(event, data)
+
+
+# Журнал действий: кто, когда и что сделал.
+action_log: list[dict[str, object]] = []
+
+
+def log_action(user_id: int, action: str, detail: str = "") -> None:
+    action_log.append(
+        {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "user": user_id,
+            "action": action,
+            "detail": detail,
+        }
+    )
+    del action_log[:-ACTION_LOG_LIMIT]
+    log.info("Действие %s от id=%s: %s", action, user_id, detail)
+
+
+# Отложенные действия, ждущие подтверждения: {token: {...}}
+pending_actions: dict[str, dict[str, object]] = {}
+
+
+def store_action(user_id: int, action: str, payload: str, ttl: int = 900) -> str:
+    """Запоминает действие и возвращает короткий токен для кнопки подтверждения."""
+    now = time.time()
+    for token, item in list(pending_actions.items()):
+        if now - float(item["created"]) > ttl:  # type: ignore[arg-type]
+            pending_actions.pop(token, None)
+    token = secrets.token_hex(6)
+    pending_actions[token] = {
+        "user": user_id,
+        "action": action,
+        "payload": payload,
+        "created": now,
+    }
+    return token
+
+
+def take_action(token: str, user_id: int) -> tuple[str, str] | None:
+    """Забирает отложенное действие, если токен верный и принадлежит пользователю.
+
+    Чужой токен не расходуется: иначе посторонний, угадав токен, мог бы
+    «сжечь» подтверждение владельца.
+    """
+    item = pending_actions.get(token)
+    if not item:
+        return None
+    if item["user"] != user_id:
+        return None
+    pending_actions.pop(token, None)
+    return str(item["action"]), str(item["payload"])
+
+
+dp.callback_query.outer_middleware(CallbackSignerMiddleware())
+_rate_limiter = RateLimitMiddleware(RATE_LIMIT)
+dp.message.outer_middleware(_rate_limiter)
+dp.callback_query.outer_middleware(_rate_limiter)
+
+
+BENIGN_ERRORS = (
+    "message is not modified",
+    "message is too old",
+    "message to edit not found",
+    "query is too old",
+)
+
+
 @dp.errors()
 async def on_error(event: ErrorEvent):
-    """Не считаем ошибкой «сообщение не изменилось» (кнопка «Обновить»)."""
-    if isinstance(event.exception, TelegramBadRequest) and "message is not modified" in str(
-        event.exception
+    """Не считаем ошибкой безобидные ситуации Telegram."""
+    message = str(event.exception)
+    if isinstance(event.exception, TelegramBadRequest) and any(
+        marker in message for marker in BENIGN_ERRORS
     ):
+        log.debug("Безобидная ошибка Telegram: %s", message)
         return True
     log.error("Ошибка в обработчике: %s", event.exception, exc_info=event.exception)
     return True
@@ -164,7 +323,11 @@ pending_info: str = ""  # что и когда запланировано (дл�
 
 
 async def run_power(action: str, delay: int) -> None:
-    await asyncio.sleep(delay)
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        log.info("Запланированное действие отменено")
+        raise
     cmd = POWER_COMMANDS[OS][action]
     log.info("Выполняю: %s", cmd)
     subprocess.Popen(cmd)
@@ -172,7 +335,7 @@ async def run_power(action: str, delay: int) -> None:
 
 def schedule_power(action: str, delay: int) -> str:
     global pending_power, pending_info
-    if pending_power and not pending_power.done():
+    if pending_power is not None and not pending_power.done():
         pending_power.cancel()
     pending_power = asyncio.create_task(run_power(action, delay))
     at = (datetime.now() + timedelta(seconds=delay)).strftime("%H:%M")
@@ -181,12 +344,17 @@ def schedule_power(action: str, delay: int) -> str:
 
 
 async def cancel_pending_power() -> bool:
-    global pending_info
-    if pending_power and not pending_power.done():
-        pending_power.cancel()
-        pending_info = ""
-        return True
-    return False
+    global pending_power, pending_info
+    task, pending_power = pending_power, None
+    pending_info = ""
+    if task is None or task.done():
+        return False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return True
 
 
 # ---------------------------------------------------------------- Windows-штуки
@@ -479,129 +647,192 @@ def take_screenshot() -> bytes:
         return mss.tools.to_png(shot.rgb, shot.size)
 
 
-def get_cpu_info():
-    """Get detailed CPU information."""
+def _to_number(value: object) -> float | None:
+    """'12.3' -> 12.3, '[N/A]' -> None."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def get_cpu_info() -> dict:
+    """Подробная информация о процессоре."""
+    cores = psutil.cpu_count(logical=False) or 1
+    logical = psutil.cpu_count(logical=True) or 1
+    model = platform.processor() or ""
+    if not model and IS_WIN:
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as handle:
+                model = str(winreg.QueryValueEx(handle, "ProcessorNameString")[0]).strip()
+        except OSError:
+            model = ""
+    frequency = 0
     try:
         cpufreq = psutil.cpu_freq()
-        cores = psutil.cpu_count(logical=False) or 1
-        logical = psutil.cpu_count(logical=True) or 1
-        model = platform.processor() or "Unknown"
-        
-        try:
-            freqs = cpufreq.current if cpufreq else 0
-        except:
-            freqs = 0
-        
-        return {
-            "cores": cores,
-            "logical": logical,
-            "model": model,
-            "frequency_mhz": freqs
-        }
-    except Exception:
-        return {"cores": 1, "logical": 1, "model": "Unknown", "frequency_mhz": 0}
+        frequency = int(cpufreq.current) if cpufreq else 0
+    except (AttributeError, NotImplementedError, OSError, ZeroDivisionError):
+        frequency = 0
+    return {
+        "cores": cores,
+        "logical": logical,
+        "model": model or "Unknown",
+        "frequency_mhz": frequency,
+    }
 
-def get_ram_info():
-    """Get RAM information."""
+
+def get_ram_info() -> dict:
+    """Информация об оперативной памяти."""
     try:
         mem = psutil.virtual_memory()
-        return {
-            "total_gb": round(mem.total / (1024**3), 2),
-            "used_gb": round(mem.used / (1024**3), 2),
-            "free_gb": round(mem.free / (1024**3), 2),
-            "percent": mem.percent
-        }
-    except Exception:
-        return {"total_gb": 0, "used_gb": 0, "free_gb": 0, "percent": 0}
+    except psutil.Error:
+        return {"total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "percent": 0.0}
+    return {
+        "total_gb": round(mem.total / (1024**3), 2),
+        "used_gb": round(mem.used / (1024**3), 2),
+        "free_gb": round(mem.free / (1024**3), 2),
+        "percent": mem.percent,
+    }
 
-def get_disk_info():
-    """Get disk drive information."""
+
+def get_disk_info() -> list[dict]:
+    """Информация по всем дискам. Недоступные разделы просто пропускаются."""
+    disks = []
+    for partition in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except (psutil.Error, OSError):
+            continue
+        disks.append(
+            {
+                "device": partition.device,
+                "mountpoint": partition.mountpoint,
+                "fstype": partition.fstype,
+                "total_gb": round(usage.total / (1024**3), 2),
+                "free_gb": round(usage.free / (1024**3), 2),
+                "used_gb": round(usage.used / (1024**3), 2),
+                "percent": usage.percent,
+            }
+        )
+    return disks
+
+def _nvidia_gpu_info() -> list[dict]:
+    """Реальные данные по видеокарте через nvidia-smi, если он установлен."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return []
     try:
-        disks = []
-        partitions = psutil.disk_partitions()
-        for partition in partitions:
-            try:
-                usage = psutil.disk_usage(partition.mountpoint)
-                disks.append({
-                    "device": partition.device,
-                    "mountpoint": partition.mountpoint,
-                    "fstype": partition.fstype,
-                    "total_gb": round(usage.total / (1024**3), 2),
-                    "free_gb": round(usage.free / (1024**3), 2),
-                    "used_gb": round(usage.used / (1024**3), 2),
-                    "percent": usage.percent
-                })
-            except Exception:
-                continue
-        return disks
-    except Exception:
-        return [{"device": "Unknown", "mountpoint": "Unknown", "fstype": "Unknown", 
-                 "total_gb": 0, "free_gb": 0, "used_gb": 0, "percent": 0}]
+        result = subprocess.run(
+            [
+                exe,
+                "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    gpus = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 5:
+            continue
+        gpus.append(
+            {
+                "name": parts[0] or "NVIDIA",
+                "load": _to_number(parts[3]),
+                "memory_mb": _to_number(parts[1]),
+                "memory_used_mb": _to_number(parts[2]),
+                "temperature": _to_number(parts[4]),
+            }
+        )
+    return gpus
 
-def get_gpu_info():
-    """Get GPU information (best effort)."""
+
+def _wmi_gpu_info() -> list[dict]:
+    """Видеокарты через WMI — работает с любым GPU, но без загрузки в процентах."""
     try:
         import win32com.client
-        wmi_obj = win32com.client.GetObject("winmgmts:")
+    except ImportError:
+        return []
+    try:
+        wmi = win32com.client.GetObject("winmgmts:")
         gpus = []
-        for gpu in wmi_obj.Query("SELECT * FROM Win32_VideoController"):
-            gpus.append({
-                "name": gpu.Name or "Unknown",
-                "load": "N/A",
-                "memory_mb": gpu.AdapterMemory // (1024**2) if gpu.AdapterMemory else 0,
-                "temperature": "N/A"
-            })
-        return gpus if gpus else [{"name": "No GPU info", "load": "N/A", "memory_mb": 0, "temperature": "N/A"}]
-    except Exception:
-        try:
-            return [{"name": "PSUtil limited", "load": "N/A", "memory_mb": 0, "temperature": "N/A"}]
-        except Exception:
-            return [{"name": "No GPU info available", "load": "N/A", "memory_mb": 0, "temperature": "N/A"}]
-
-def get_system_uptime():
-    """Get system uptime."""
-    try:
-        boot_time = psutil.boot_time()
-        uptime_seconds = time.time() - boot_time
-        days = int(uptime_seconds // 86400)
-        hours = int((uptime_seconds % 86400) // 3600)
-        minutes = int((uptime_seconds % 3600) // 60)
-        return f"{days}д {hours}ч {minutes}мин"
-    except Exception:
-        return "Неизвестно"
-
-def get_windows_info():
-    """Get Windows version and architecture."""
-    try:
-        import win32api
-        version = win32api.GetVersion()
-        major = version >> 24
-        minor = version & 0x00FFFFFF
-        arch = "64-bit" if platform.architecture()[0] == '64bit' else "32-bit"
-        csd = ""
-        try:
-            csd = win32api.GetFileVersionInfo(
-                win32api.GetSystemDirectory() + "\\kernel32.dll", "\\StringFileInfo\\04E404B0\\ProductName"
+        for gpu in wmi.Query("SELECT * FROM Win32_VideoController"):
+            ram = int(gpu.AdapterRAM or 0)
+            gpus.append(
+                {
+                    "name": gpu.Name or "Unknown",
+                    "load": None,
+                    "memory_mb": ram // (1024**2),
+                    "memory_used_mb": None,
+                    "temperature": None,
+                }
             )
-        except:
-            pass
-        return f"Windows {major}.{minor} {arch}"
-    except Exception:
-        return platform.platform()
+        return gpus
+    except Exception:  # noqa: BLE001 — WMI может отдать что угодно
+        return []
 
-def get_battery_info():
-    """Get battery information for laptops."""
+
+def get_gpu_info() -> list[dict]:
+    """Видеокарты: сначала nvidia-smi (реальная загрузка и VRAM), затем WMI."""
+    gpus = _nvidia_gpu_info()
+    if gpus:
+        return gpus
+    return _wmi_gpu_info()
+
+def get_system_uptime() -> str:
+    """Время работы системы."""
+    try:
+        uptime_seconds = time.time() - psutil.boot_time()
+    except psutil.Error:
+        return "Неизвестно"
+    days = int(uptime_seconds // 86400)
+    hours = int((uptime_seconds % 86400) // 3600)
+    minutes = int((uptime_seconds % 3600) // 60)
+    return f"{days}д {hours}ч {minutes}мин"
+
+
+def get_windows_info() -> str:
+    """Версия и разрядность ОС."""
+    if IS_WIN:
+        try:
+            major, minor, build, _ptype, csd = platform.win32_ver()
+            if build >= 22000:
+                name = "Windows 11"
+            elif major == 10:
+                name = "Windows 10"
+            else:
+                name = f"Windows {major}.{minor}"
+            arch = "x64" if platform.architecture()[0] == "64bit" else "x86"
+            suffix = f" {csd}" if csd else ""
+            return f"{name} {arch} (сборка {build}{suffix})"
+        except (OSError, ValueError):
+            pass
+    return platform.platform()
+
+
+def get_battery_info() -> dict:
+    """Состояние батареи (для ноутбуков)."""
     try:
         battery = psutil.sensors_battery()
-        if battery:
-            return {
-                "percent": battery.percent,
-                "power_plugged": battery.power_plugged,
-                "secs_left": battery.secsleft if battery.secsleft != -1 else "Not specified"
-            }
-    except Exception:
-        pass
-    return {"percent": "N/A", "power_plugged": False, "secs_left": "N/A"}
+    except (AttributeError, NotImplementedError):
+        battery = None
+    if battery is None:
+        return {"percent": None, "power_plugged": False, "secs_left": None}
+    secs_left = battery.secsleft if battery.secsleft != -1 else None
+    return {
+        "percent": battery.percent,
+        "power_plugged": bool(battery.power_plugged),
+        "secs_left": secs_left,
+    }
 
 def get_temperatures():
     """Get temperature sensor readings."""
@@ -631,11 +862,12 @@ def system_stats() -> str:
     battery = get_battery_info()
     temps = get_temperatures()
 
-    cpu_model = cpu_info["model"]
+    frequency = cpu_info.get("frequency_mhz") or 0
     cpu_text = (
         f"🟢 <b>Загрузка CPU:</b> {cpu:.1f}%\n"
-        f"💻 {html.escape(cpu_model)} — {cpu_info['cores']} ядер "
+        f"💻 {html.escape(cpu_info['model'])} — {cpu_info['cores']} ядер "
         f"({cpu_info['logical']} потоков)"
+        + (f", {frequency} МГц" if frequency else "")
     )
     ram_text = (
         f"🧠 <b>Память:</b> {ram_info['percent']}% "
@@ -652,18 +884,30 @@ def system_stats() -> str:
         )
     disk_text = "\n".join(disk_parts) if disk_parts else "Диски не найдены."
 
-    gpu_names = [
-        html.escape(gpu["name"])
-        for gpu in gpus
-        if gpu.get("name") and gpu["name"] not in {"PSUtil limited", "No GPU info"}
-    ]
-    gpu_text = ", ".join(gpu_names) if gpu_names else "Информация о GPU недоступна."
+    gpu_parts = []
+    for gpu in gpus[:2]:
+        details = []
+        if gpu.get("load") is not None:
+            details.append(f"загрузка {gpu['load']:.0f}%")
+        if gpu.get("memory_mb"):
+            used = gpu.get("memory_used_mb")
+            memory = f"{gpu['memory_mb']:.0f} МБ"
+            if used is not None:
+                memory = f"{used:.0f} / {gpu['memory_mb']:.0f} МБ"
+            details.append(f"VRAM {memory}")
+        if gpu.get("temperature") is not None:
+            details.append(f"{gpu['temperature']:.0f} °C")
+        suffix = f" ({', '.join(details)})" if details else ""
+        gpu_parts.append(f"• {html.escape(gpu['name'])}{suffix}")
+    gpu_text = "\n".join(gpu_parts) if gpu_parts else "Информация о GPU недоступна."
 
-    if battery["percent"] == "N/A":
+    if battery["percent"] is None:
         battery_text = "Данные о батарее недоступны."
     else:
         power = "от сети" if battery["power_plugged"] else "от батареи"
         battery_text = f"{battery['percent']:.0f}% ({power})"
+        if battery["secs_left"]:
+            battery_text += f", осталось {battery['secs_left'] // 60} мин"
 
     if temps:
         temp_text = "\n".join(
@@ -682,7 +926,7 @@ def system_stats() -> str:
         "💿 <b>Диски</b>",
         disk_text,
         "",
-        f"🎮 <b>GPU:</b> {gpu_text}",
+        f"🎮 <b>GPU</b>\n{gpu_text}",
         f"🔋 <b>Батарея:</b> {battery_text}",
         f"⏰ <b>Время работы:</b> {uptime}",
         f"🪟 <b>Система:</b> {html.escape(windows)}",
@@ -699,10 +943,28 @@ PROTECTED = {
     "system", "system idle process", "registry", "smss.exe", "csrss.exe",
     "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
     "dwm.exe", "fontdrvhost.exe", "memory compression", "secure system",
+    # оболочка и системные службы: их закрытие ломает рабочий стол
+    "explorer.exe", "conhost.exe", "searchhost.exe", "searchapp.exe",
+    "startmenuexperiencehost.exe", "shellexperiencehost.exe",
+    "textinputhost.exe", "lockapp.exe", "runtimebroker.exe", "sihost.exe",
+    "wudfhost.exe", "ctfmon.exe", "taskhostw.exe", "spoolsv.exe",
+    "lsaiso.exe", "securityhealthservice.exe", "audiodg.exe", "wmiprvse.exe",
+    "rundll32.exe", "dllhost.exe", "wmiapsrv.exe",
 }
 
 
-def process_rows(n: int = 10) -> list[tuple[float, float, int, str]]:
+def protected_pids() -> set[int]:
+    """PID'ы, которые нельзя закрывать: система, сам бот и панель управления."""
+    pids = {0, 4, os.getpid()}
+    try:
+        pids.add(os.getppid())
+    except OSError:
+        pass
+    return pids
+
+
+def process_rows(n: int | None = 10) -> list[tuple[float, float, int, str]]:
+    """Список процессов: (CPU %, RAM %, PID, имя). n=None — без ограничения."""
     procs = list(psutil.process_iter(["name"]))
     for p in procs:
         try:
@@ -720,29 +982,16 @@ def process_rows(n: int = 10) -> list[tuple[float, float, int, str]]:
         except psutil.Error:
             continue
     rows.sort(reverse=True)
-    return rows[:n]
+    return rows if n is None else rows[:n]
 
 
-def all_process_rows() -> list[tuple[float, float, int, str]]:
-    """Показывает все процессы (не ограниченные по количеству)"""
-    procs = list(psutil.process_iter(["name"]))
-    for p in procs:
-        try:
-            p.cpu_percent(None)
-        except psutil.Error:
-            pass
-    time.sleep(0.7)
-    cores = psutil.cpu_count() or 1
-    rows = []
-    for p in procs:
-        if p.pid in (0, 4):
-            continue
-        try:
-            rows.append((p.cpu_percent(None) / cores, p.memory_percent(), p.pid, p.info["name"] or "?"))
-        except psutil.Error:
-            continue
-    rows.sort(reverse=True)
-    return rows
+def sort_rows(rows: list[tuple[float, float, int, str]], sort: str) -> list[tuple[float, float, int, str]]:
+    """Сортирует процессы: по CPU, по RAM или по имени."""
+    if sort == "ram":
+        return sorted(rows, key=lambda row: (-row[1], row[3].lower()))
+    if sort == "name":
+        return sorted(rows, key=lambda row: row[3].lower())
+    return sorted(rows, key=lambda row: (-row[0], row[3].lower()))
 
 
 def format_rows(rows) -> str:
@@ -753,8 +1002,8 @@ def format_rows(rows) -> str:
 
 
 def kill_process(pid: int) -> str:
-    if pid == os.getpid():
-        raise RuntimeError("Это сам бот — его так не закрыть")
+    if pid in protected_pids():
+        raise RuntimeError("Это сам бот или системный процесс — его так не закрыть")
     p = psutil.Process(pid)
     name = p.name()
     if name.lower() in PROTECTED:
@@ -769,7 +1018,13 @@ def kill_process(pid: int) -> str:
 
 # ---------------------------------------------------------------- клавиатуры
 
-b = InlineKeyboardButton
+
+def b(text: str, **kwargs) -> InlineKeyboardButton:
+    """Кнопка с подписанным callback_data — подделать её извне невозможно."""
+    data = kwargs.get("callback_data")
+    if isinstance(data, str):
+        kwargs["callback_data"] = sign_data(data)
+    return InlineKeyboardButton(text=text, **kwargs)
 
 
 def kb(rows) -> InlineKeyboardMarkup:
@@ -876,17 +1131,51 @@ def clip_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def procs_menu(rows) -> InlineKeyboardMarkup:
-    buttons, line = [], []
-    for _cpu, _mem, pid, name in rows[:8]:
-        line.append(b(text=f"❌ {name[:20]}", callback_data=f"kill:{pid}"))
+PROC_PAGE_SIZE = 8
+PROC_SORTS = (("cpu", "CPU"), ("ram", "RAM"), ("name", "Имя"))
+
+
+def procs_menu(rows, page: int = 0, sort: str = "cpu") -> InlineKeyboardMarkup:
+    """Клавиатура списка процессов: закрытие, сортировка, страницы."""
+    pages = max(1, math.ceil(len(rows) / PROC_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * PROC_PAGE_SIZE:(page + 1) * PROC_PAGE_SIZE]
+    buttons: list[list] = []
+    line: list = []
+    for _cpu, _mem, pid, name in chunk:
+        line.append(b(text=f"❌ {name[:18]}", callback_data=f"kill:{pid}"))
         if len(line) == 2:
             buttons.append(line)
             line = []
     if line:
         buttons.append(line)
-    buttons.append([b(text="🔄 Обновить", callback_data="procs"), BACK])
+    buttons.append(
+        [
+            b(text=f"{'✓ ' if sort == key else ''}{label}", callback_data=f"procs:{key}:0")
+            for key, label in PROC_SORTS
+        ]
+    )
+    nav = []
+    if page > 0:
+        nav.append(b(text="◀️", callback_data=f"procs:{sort}:{page - 1}"))
+    nav.append(b(text=f"{page + 1}/{pages}", callback_data=f"procs:{sort}:{page}"))
+    if page < pages - 1:
+        nav.append(b(text="▶️", callback_data=f"procs:{sort}:{page + 1}"))
+    buttons.append(nav)
+    buttons.append([BACK])
     return kb(buttons)
+
+
+def procs_text(rows, page: int = 0, sort: str = "cpu") -> str:
+    """Текст страницы списка процессов."""
+    pages = max(1, math.ceil(len(rows) / PROC_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * PROC_PAGE_SIZE:(page + 1) * PROC_PAGE_SIZE]
+    return (
+        f"<pre>{html.escape(format_rows(chunk))}</pre>\n"
+        f"Страница {page + 1}/{pages}, всего {len(rows)}. "
+        "Нажми ❌, чтобы закрыть программу."
+    )
 
 
 HELP = (
@@ -895,15 +1184,18 @@ HELP = (
     "📎 <b>Пришли файл, фото или видео</b> — сохраню в «Загрузки» на ПК (до 20 МБ).\n\n"
     "<b>Команды</b>\n"
     "/menu — меню\n"
+    "/help — эта справка\n"
+    "/stats — состояние ПК\n"
+    "/procs — процессы (сортировка и страницы)\n"
+    "/allprocs — все процессы по имени\n"
     "/screenshot — скриншот экрана\n"
     "/webcam — фото с веб-камеры\n"
-    "/stats — состояние ПК\n"
-    "/procs — топ процессов\n"
     "/ask <code>вопрос</code> — спросить ИИ через OpenRouter\n"
     "/msg <code>текст</code> — показать сообщение на экране ПК\n"
     "/clip — что в буфере обмена\n"
     "/open <code>путь | программа | URL</code> — открыть\n"
     "/cancel — отменить запланированное действие\n"
+    + ("/closeall — закрыть все пользовательские процессы\n" if ALLOW_SHELL else "")
     + ("/run <code>команда</code> — выполнить команду в оболочке\n" if ALLOW_SHELL else "")
     + ("/get <code>путь</code> — получить файл с ПК\n" if ALLOW_FILES else "")
 )
@@ -1048,24 +1340,54 @@ async def cb_stats(c: CallbackQuery):
     )
 
 
-PROCS_TEXT = "<pre>{}</pre>\nНажми ❌, чтобы закрыть программу."
+async def show_processes(c: CallbackQuery, sort: str = "cpu", page: int = 0) -> None:
+    """Показывает страницу списка процессов с кнопками сортировки."""
+    rows = await asyncio.to_thread(process_rows, None)
+    rows = sort_rows(rows, sort)
+    try:
+        await c.message.edit_text(
+            procs_text(rows, page, sort),
+            parse_mode="HTML",
+            reply_markup=procs_menu(rows, page, sort),
+        )
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error):
+            log.warning("Не удалось обновить список процессов: %s", error)
 
 
 @dp.message(Command("procs"))
 async def cmd_procs(m: Message):
-    rows = await asyncio.to_thread(process_rows)
-    await m.answer(PROCS_TEXT.format(html.escape(format_rows(rows))), parse_mode="HTML",
-                   reply_markup=procs_menu(rows))
+    rows = await asyncio.to_thread(process_rows, None)
+    rows = sort_rows(rows, "cpu")
+    await m.answer(
+        procs_text(rows, 0, "cpu"),
+        parse_mode="HTML",
+        reply_markup=procs_menu(rows, 0, "cpu"),
+    )
 
 
 @dp.callback_query(F.data == "procs")
 async def cb_procs(c: CallbackQuery):
+    await c.answer("Собираю список…")
+    await show_processes(c, "cpu", 0)
+
+
+@dp.callback_query(F.data.startswith("procs:"))
+async def cb_procs_nav(c: CallbackQuery):
+    parts = c.data.split(":")
+    sort = parts[1] if len(parts) > 1 and parts[1] in dict(PROC_SORTS) else "cpu"
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
     await c.answer()
-    rows = await asyncio.to_thread(process_rows)
+    await show_processes(c, sort, page)
+
 
 @dp.callback_query(F.data.startswith("kill:"))
 async def cb_kill_ask(c: CallbackQuery):
-    pid = int(c.data.split(":", 1)[1])
+    raw = c.data.split(":", 1)[1]
+    if not raw.isdigit():
+        await c.answer("Некорректный PID.", show_alert=True)
+        return
+    pid = int(raw)
     await c.answer()
     try:
         name = psutil.Process(pid).name()
@@ -1081,11 +1403,16 @@ async def cb_kill_ask(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("killok:"))
 async def cb_kill(c: CallbackQuery):
-    pid = int(c.data.split(":", 1)[1])
+    raw = c.data.split(":", 1)[1]
+    if not raw.isdigit():
+        await c.answer("Некорректный PID.", show_alert=True)
+        return
+    pid = int(raw)
     await c.answer()
     try:
         name = await asyncio.to_thread(kill_process, pid)
         text = f"✅ {html.escape(name)} закрыт."
+        log_action(c.from_user.id, "kill", f"{name} (PID {pid})")
     except psutil.NoSuchProcess:
         text = "Этот процесс уже закрыт."
     except psutil.AccessDenied:
@@ -1097,42 +1424,55 @@ async def cb_kill(c: CallbackQuery):
 
 @dp.message(Command("allprocs"))
 async def cmd_allprocs(m: Message):
-    rows = await asyncio.to_thread(all_process_rows)
-    await m.answer(PROCS_TEXT.format(html.escape(format_rows(rows))), parse_mode="HTML",
-                   reply_markup=procs_menu(rows))
+    rows = await asyncio.to_thread(process_rows, None)
+    rows = sort_rows(rows, "name")
+    await m.answer(
+        procs_text(rows, 0, "name"),
+        parse_mode="HTML",
+        reply_markup=procs_menu(rows, 0, "name"),
+    )
 
 
 @dp.callback_query(F.data == "allprocs")
 async def cb_allprocs(c: CallbackQuery):
     await c.answer()
-    rows = await asyncio.to_thread(all_process_rows)
-    await c.message.edit_text(PROCS_TEXT.format(html.escape(format_rows(rows))), parse_mode="HTML",
-                              reply_markup=procs_menu(rows))
+    rows = await asyncio.to_thread(process_rows, None)
+    rows = sort_rows(rows, "name")
+    await c.message.edit_text(
+        procs_text(rows, 0, "name"),
+        parse_mode="HTML",
+        reply_markup=procs_menu(rows, 0, "name"),
+    )
 
 
 def close_all_processes() -> dict:
-    """Закрыть все пользовательские процессы (не системные)"""
+    """Закрыть все пользовательские процессы (не системные)."""
     result = {"success": [], "errors": [], "protected": []}
-    procs = list(psutil.process_iter(["name", "pid"]))
-    
-    for p in procs:
+    protected = protected_pids()
+    for p in psutil.process_iter(["name", "pid"]):
         if p.pid in (0, 4):
             continue
         try:
             name = p.name()
-            if name.lower() in PROTECTED:
+            if name.lower() in PROTECTED or p.pid in protected:
                 result["protected"].append({"pid": p.pid, "name": name})
                 continue
             kill_process(p.pid)
             result["success"].append({"pid": p.pid, "name": name})
         except psutil.NoSuchProcess:
-            result["errors"].append({"pid": p.pid, "name": p.info.get("name", "?")})
+            result["errors"].append({"pid": p.pid, "name": "?", "reason": "уже закрыт"})
         except psutil.AccessDenied:
-            result["errors"].append({"pid": p.pid, "name": p.info.get("name", "?"), "reason": "нет прав"})
-        except Exception as e:
-            result["errors"].append({"pid": p.pid, "name": p.info.get("name", "?"), "reason": str(e)})
-    
+            result["errors"].append({"pid": p.pid, "name": "?", "reason": "нет прав"})
+        except Exception as e:  # noqa: BLE001
+            result["errors"].append({"pid": p.pid, "name": "?", "reason": str(e)})
     return result
+
+
+CLOSEALL_WARNING = (
+    "⚠️ <b>Закрыть все пользовательские процессы?</b>\n"
+    "Несохранённые данные в программах пропадут. "
+    "Системные процессы, сам бот и панель управления останутся работать."
+)
 
 
 @dp.message(Command("closeall"))
@@ -1140,48 +1480,77 @@ async def cmd_closeall(m: Message):
     if not ALLOW_SHELL:
         await m.answer("Эта функция отключена (ALLOW_SHELL=false)", reply_markup=main_menu())
         return
-    
-    await m.answer("⚠️ Запрашиваю подтверждение...", reply_markup=detail_menu("closeall"))
-    # Set a flag to confirm the action
-    m.from_user.id = getattr(m, '_closeall_confirmed', False)
+    await m.answer(
+        CLOSEALL_WARNING,
+        parse_mode="HTML",
+        reply_markup=confirm_kb("closeall_ok", "menu"),
+    )
 
 
 @dp.callback_query(F.data == "closeall")
 async def cb_closeall(c: CallbackQuery):
-    await c.answer("⚠️ Запрашиваю закрытие всех процессов...")
+    """Только запрашивает подтверждение — ничего не закрывает."""
+    await c.answer()
+    if not ALLOW_SHELL:
+        await c.message.edit_text(
+            "Эта функция отключена (ALLOW_SHELL=false).",
+            reply_markup=main_menu(),
+        )
+        return
+    await c.message.edit_text(
+        CLOSEALL_WARNING,
+        parse_mode="HTML",
+        reply_markup=confirm_kb("closeall_ok", "menu"),
+    )
+
+
+@dp.callback_query(F.data == "closeall_ok")
+async def cb_closeall_ok(c: CallbackQuery):
+    await c.answer("Закрываю процессы…")
+    if not ALLOW_SHELL:
+        await c.message.edit_text(
+            "Эта функция отключена (ALLOW_SHELL=false).",
+            reply_markup=main_menu(),
+        )
+        return
+    log_action(c.from_user.id, "closeall")
     try:
         result = await asyncio.to_thread(close_all_processes)
-        success_count = len(result["success"])
-        protected_count = len(result["protected"])
-        error_count = len(result["errors"])
-        
-        text = (
-            f"⚠️ <b>Закрыто процессов:</b> {success_count}\\n"
-            f"🛡️ Защищённых процессов: {protected_count}\\n"
-            f"❌ Ошибок: {error_count}\\n"
+    except Exception as e:  # noqa: BLE001
+        log.exception("Не удалось закрыть процессы")
+        await c.message.edit_text(
+            f"❌ Ошибка: {html.escape(str(e))}",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
         )
-        
-        if result["protected"]:
-            text += f"\\n🏛 <b>Не удалось закрыть системные процессы:</b>\\n"
-            for p in result["protected"]:
-                text += f"• {p['name']} (PID {p['pid']})\\n"
-        
-        if result["errors"]:
-            text += f"\\n⚠️ <b>Ошибки:</b>\\n"
-            for err in result["errors"][:3]:
-                name = err.get('name', '?')
-                pid = err.get('pid', '?')
-                reason = err.get('reason', 'неизвестно')
-                text += f"• {name} (PID {pid}): {reason}\\n"
-            if len(result["errors"]) > 3:
-                text += f"... и ещё {len(result['errors']) - 3}\\n"
-        
-        if success_count > 0:
-            text += f"\\n✅ Успешно закрыто {success_count} процессов."
-        
-        await c.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu())
-    except Exception as e:
-        await c.message.edit_text(f"❌ Ошибка: {html.escape(str(e))}", parse_mode="HTML", reply_markup=main_menu())
+        return
+
+    success = result["success"]
+    protected = result["protected"]
+    errors = result["errors"]
+    text = (
+        f"⚠️ <b>Закрыто процессов:</b> {len(success)}\n"
+        f"🛡️ Защищённых процессов: {len(protected)}\n"
+        f"❌ Ошибок: {len(errors)}\n"
+    )
+    if protected:
+        text += "\n🏛 <b>Системные процессы оставлены:</b>\n"
+        for item in protected[:5]:
+            text += f"• {html.escape(str(item['name']))} (PID {item['pid']})\n"
+        if len(protected) > 5:
+            text += f"… и ещё {len(protected) - 5}\n"
+    if errors:
+        text += "\n⚠️ <b>Ошибки:</b>\n"
+        for item in errors[:3]:
+            name = html.escape(str(item.get("name", "?")))
+            pid = item.get("pid", "?")
+            reason = html.escape(str(item.get("reason", "неизвестно")))
+            text += f"• {name} (PID {pid}): {reason}\n"
+        if len(errors) > 3:
+            text += f"… и ещё {len(errors) - 3}\n"
+    if success:
+        text += f"\n✅ Успешно закрыто {len(success)} процессов."
+    await c.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu())
 
  # ---------------------------------------------------------------- звук
 # ---------------------------------------------------------------- звук
@@ -1234,18 +1603,33 @@ async def cb_app(c: CallbackQuery):
     except Exception as e:  # noqa: BLE001
         await c.answer(str(e), show_alert=True)
         return
+    log_action(c.from_user.id, "launch", APPS[key][0])
     # После запуска показываем, что можно делать внутри программы
     if key == "steam":
         await show_steam_games(c, 0)
     elif key == "chrome":
         await c.message.edit_text("🌐 <b>Chrome</b> запускается — что открыть?", parse_mode="HTML",
                                   reply_markup=sites_menu())
-    elif key == "telegram" and TG_LINKS:
-        await c.message.edit_text("✈️ <b>Telegram</b> запускается — какой чат открыть?", parse_mode="HTML",
-                                  reply_markup=tg_menu())
+    elif key == "telegram":
+        if TG_LINKS:
+            await c.message.edit_text("✈️ <b>Telegram</b> запускается — какой чат открыть?", parse_mode="HTML",
+                                      reply_markup=tg_menu())
+        else:
+            await c.message.edit_text(
+                "✈️ <b>Telegram</b> запускается.\n"
+                "Список избранных чатов пуст — его можно задать в файле bot.py (TG_LINKS).",
+                parse_mode="HTML",
+                reply_markup=kb([[b(text="⬅️ Программы", callback_data="apps"), BACK]]),
+            )
     elif key == "music":
         await c.message.edit_text("🎵 <b>Яндекс Музыка</b> запускается — управление музыкой:",
                                   parse_mode="HTML", reply_markup=sound_menu())
+    else:
+        await c.message.edit_text(
+            f"✅ <b>{html.escape(APPS[key][0])}</b> запускается.",
+            parse_mode="HTML",
+            reply_markup=kb([[b(text="⬅️ Программы", callback_data="apps"), BACK]]),
+        )
 
 
 async def show_steam_games(c: CallbackQuery, page: int):
@@ -1552,26 +1936,17 @@ async def cmd_run(m: Message, command: CommandObject):
     if not command.args:
         await m.answer("Использование: /run <команда>")
         return
-    log.info("run: %s", command.args)
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            command.args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await m.answer("Таймаут 30 с, процесс убит.")
-            return
-        text = out.decode(CONSOLE_ENC, errors="replace").strip() or "(пустой вывод)"
-        if len(text) > 3500:
-            await m.answer_document(BufferedInputFile(text.encode(), "output.txt"))
-        else:
-            await m.answer(f"<pre>{html.escape(text)}</pre>", parse_mode="HTML")
-    except Exception as e:  # noqa: BLE001
-        await m.answer(f"Ошибка: {e}")
+    payload = command.args.strip()
+    token = store_action(m.from_user.id, "run", payload)
+    await m.answer(
+        f"💻 <b>Выполнить команду?</b>\n<code>{html.escape(payload)}</code>\n"
+        "Команда выполнится в оболочке от твоего имени.",
+        parse_mode="HTML",
+        reply_markup=kb([
+            [b(text="✅ Выполнить", callback_data=f"act:run:{token}"),
+             b(text="↩️ Отмена", callback_data="menu")]
+        ]),
+    )
 
 
 @dp.message(Command("get"))
@@ -1586,10 +1961,85 @@ async def cmd_get(m: Message, command: CommandObject):
     if not path.is_file():
         await m.answer("Файл не найден.")
         return
-    if path.stat().st_size > 50 * 2**20:
+    size = path.stat().st_size
+    if size > 50 * 2**20:
         await m.answer("Файл больше 50 МБ — Telegram не пропустит.")
         return
-    await m.answer_document(FSInputFile(path))
+    token = store_action(m.from_user.id, "get", str(path))
+    await m.answer(
+        f"📤 <b>Отправить файл?</b>\n<code>{html.escape(str(path))}</code>\n"
+        f"Размер: {size / 1024:.1f} КБ",
+        parse_mode="HTML",
+        reply_markup=kb([
+            [b(text="✅ Отправить", callback_data=f"act:get:{token}"),
+             b(text="↩️ Отмена", callback_data="menu")]
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("act:"))
+async def cb_pending_action(c: CallbackQuery):
+    """Подтверждение отложенного действия: запуск команды или отправка файла."""
+    parts = c.data.split(":")
+    if len(parts) != 3:
+        await c.answer("Некорректное действие.", show_alert=True)
+        return
+    action, token = parts[1], parts[2]
+    pending = take_action(token, c.from_user.id)
+    if pending is None:
+        await c.answer("Действие устарело или уже выполнено.", show_alert=True)
+        return
+    kind, payload = pending
+    await c.answer()
+
+    if kind == "run":
+        if not ALLOW_SHELL:
+            await c.message.edit_text("Выполнение команд выключено.", reply_markup=main_menu())
+            return
+        log_action(c.from_user.id, "run", payload)
+        await c.message.edit_text("⏳ Выполняю…", reply_markup=main_menu())
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                payload,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await c.message.answer("Таймаут 30 с, процесс убит.", reply_markup=main_menu())
+                return
+            text = out.decode(CONSOLE_ENC, errors="replace").strip() or "(пустой вывод)"
+            if len(text) > 3500:
+                await c.message.answer_document(BufferedInputFile(text.encode(), "output.txt"))
+            else:
+                await c.message.answer(
+                    f"<pre>{html.escape(text)}</pre>", parse_mode="HTML", reply_markup=main_menu()
+                )
+        except Exception as e:  # noqa: BLE001
+            await c.message.answer(f"Ошибка: {html.escape(str(e))}", reply_markup=main_menu())
+        return
+
+    if kind == "get":
+        if not ALLOW_FILES:
+            await c.message.edit_text("Отправка файлов выключена.", reply_markup=main_menu())
+            return
+        path = Path(payload)
+        log_action(c.from_user.id, "get", str(path))
+        if not path.is_file():
+            await c.message.answer("Файл не найден.", reply_markup=main_menu())
+            return
+        if path.stat().st_size > 50 * 2**20:
+            await c.message.answer("Файл больше 50 МБ — Telegram не пропустит.", reply_markup=main_menu())
+            return
+        try:
+            await c.message.answer_document(FSInputFile(path))
+        except Exception as e:  # noqa: BLE001
+            await c.message.answer(f"Не получилось отправить: {html.escape(str(e))}", reply_markup=main_menu())
+        return
+
+    await c.answer("Неизвестное действие.", show_alert=True)
 
 
 def safe_name(name: str) -> str:
@@ -1608,6 +2058,9 @@ def unique_path(folder: Path, name: str) -> Path:
 
 @dp.message(F.document | F.photo | F.video | F.audio | F.voice | F.video_note)
 async def receive_file(m: Message):
+    # Файл тоже завершает ожидание ввода — иначе следующий текст уйдёт
+    # в буфер обмена или в окно сообщения.
+    waiting_input.pop(m.from_user.id, None)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if m.document:
         obj, name = m.document, m.document.file_name or f"file_{stamp}"
@@ -1661,10 +2114,12 @@ async def main():
     log.info("Бот @%s запущен. Разрешённые id: %s", me.username, sorted(ALLOWED))
     commands = [
         BotCommand(command="menu", description="Открыть панель управления"),
+        BotCommand(command="help", description="Справка по командам"),
         BotCommand(command="screenshot", description="Сделать скриншот"),
         BotCommand(command="webcam", description="Фото с веб-камеры"),
         BotCommand(command="stats", description="Состояние компьютера"),
-        BotCommand(command="procs", description="Топ процессов"),
+        BotCommand(command="procs", description="Процессы: сортировка и страницы"),
+        BotCommand(command="allprocs", description="Все процессы по имени"),
         BotCommand(command="ask", description="Задать вопрос OpenRouter"),
         BotCommand(command="msg", description="Сообщение на экран ПК"),
         BotCommand(command="clip", description="Что в буфере обмена"),
@@ -1672,6 +2127,7 @@ async def main():
         BotCommand(command="cancel", description="Отменить запланированное действие"),
     ]
     if ALLOW_SHELL:
+        commands.append(BotCommand(command="closeall", description="Закрыть все процессы"))
         commands.append(BotCommand(command="run", description="Выполнить команду оболочки"))
     if ALLOW_FILES:
         commands.append(BotCommand(command="get", description="Получить файл"))

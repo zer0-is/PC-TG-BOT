@@ -1,0 +1,38 @@
+[project]
+name = "pc-bot"
+version = "2.0.0"
+description = "Telegram-бот и панель управления своим компьютером"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist", "releases"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RET"]
+ignore = [
+    "E501",    # длину строк контролируем вручную
+    "B008",    # вызовы в аргументах — норма для Tkinter
+    "SIM108",  # тернарный оператор не всегда читается
+    "RET504",  # именованный результат перед return
+    "UP038",   # isinstance-кортежи
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "SIM117"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = false
+exclude = ["^build/", "^dist/", "^\\.venv/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

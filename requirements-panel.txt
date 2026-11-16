@@ -1,0 +1,5 @@
+# Панель управления на Qt.
+# Подключается на этапе переноса панели с customtkinter на PySide6.
+# PySide6-Essentials вместо полного PySide6: экономит ~150 МБ в сборке.
+
+PySide6-Essentials>=6.7,<7

@@ -8,10 +8,14 @@
 __pycache__/
 *.py[cod]
 .vscode/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Build output, temporary files, and logs
 build/
 dist/
+releases/
 *.spec
 *.log
 logs/
@@ -19,5 +23,5 @@ logs/
 *.tmp
 *.bak
 
-# Legacy per-machine startup helper
-autostart_on.bat
+# Lock file of the single-instance panel guard
+*.lock
