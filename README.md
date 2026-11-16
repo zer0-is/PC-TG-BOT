@@ -130,7 +130,19 @@ Telegram ID в списке разрешённых пользователей. �
 ## Структура проекта
 
 ```text
-bot.py                     Telegram-бот
+bot.py                     Точка входа (совместимость и ручной запуск)
+pcbot/                     Логика бота
+  config.py                Настройки из .env и окружения
+  runtime.py               Bot, Dispatcher, общее состояние, middleware
+  security.py              Белый список, подпись кнопок, лимиты, журнал
+  ui.py                    Клавиатуры, меню и тексты
+  system.py                Процессор, память, диски, GPU, датчики
+  processes.py             Список процессов и их закрытие
+  windows_api.py           Клавиши, буфер, камера, программы, Steam
+  power.py                 Выключение, перезагрузка, сон, блокировка
+  ai.py                    Запросы к OpenRouter
+  app.py                   Регистрация обработчиков и запуск
+  handlers/                Обработчики Telegram по темам
 control_panel.py           Графическая панель Windows
 requirements.txt           Зависимости бота
 requirements-panel.txt     Зависимости панели на Qt

@@ -1,19 +1,25 @@
 """Тест, который не даёт «забыть» кнопку без обработчика.
 
-Разбирает исходник bot.py: собирает все callback_data, которые бот отправляет,
-и все шаблоны, которые он обрабатывает, затем требует полного совпадения.
-Раньше так ловились кнопки вроде «Процессы», обработчик которой был пустым.
+Разбирает исходники пакета pcbot: собирает все callback_data, которые бот
+отправляет, и все шаблоны, которые он обрабатывает, затем требует полного
+совпадения. Раньше так ловились кнопки вроде «Процессы», обработчик которой
+был пустым.
 """
 import ast
 from pathlib import Path
 
 import bot
 
-SOURCE = Path(bot.__file__)
+PACKAGE = Path(bot.__file__).resolve().parent / "pcbot"
+SOURCES = sorted(PACKAGE.rglob("*.py"))
 
 
 def _parse() -> ast.Module:
-    return ast.parse(SOURCE.read_text(encoding="utf-8"))
+    """Сводит все модули пакета в одно дерево — проверки ходят по нему целиком."""
+    body = []
+    for path in SOURCES:
+        body.extend(ast.parse(path.read_text(encoding="utf-8")).body)
+    return ast.Module(body=body, type_ignores=[])
 
 
 def _is_data_attr(node: ast.AST) -> bool:

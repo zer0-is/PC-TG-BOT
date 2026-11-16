@@ -17,20 +17,26 @@ ignore = [
     "B008",    # вызовы в аргументах — норма для Tkinter
     "SIM108",  # тернарный оператор не всегда читается
     "RET504",  # именованный результат перед return
-    "UP038",   # isinstance-кортежи
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011", "SIM117"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 ignore_missing_imports = true
 warn_unused_configs = true
 warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = false
 exclude = ["^build/", "^dist/", "^\\.venv/"]
+
+[[tool.mypy.overrides]]
+# В обработчиках aiogram объявляет message и from_user как Optional: сообщение
+# отсутствует только в inline-режиме, который бот не поддерживает, а без
+# from_user не бывает апдейтов вовсе (белый список отсекает остальных).
+module = ["pcbot.handlers.*"]
+disable_error_code = ["union-attr"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

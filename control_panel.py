@@ -2,9 +2,7 @@ import asyncio
 import ctypes
 import hashlib
 import logging
-from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import queue
 import re
 import subprocess
@@ -12,13 +10,14 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
+import pystray
 from dotenv import dotenv_values
 from PIL import Image, ImageDraw
-import pystray
-
 
 APP_DIR = (
     Path(sys.executable).resolve().parent
@@ -54,7 +53,7 @@ class SingleInstance:
 
     def __init__(self, path: Path):
         self.path = path
-        self._handle = None
+        self._handle: object | None = None
 
     def acquire(self) -> bool:
         """Забирает блокировку. False — панель уже запущена."""
@@ -67,7 +66,7 @@ class SingleInstance:
         handle = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.path, "a+b")
+            handle = open(self.path, "a+b")  # noqa: SIM115 — держим открытым ради блокировки
             handle.seek(0)
             handle.write(b"0")
             handle.flush()
