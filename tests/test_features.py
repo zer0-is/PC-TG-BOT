@@ -83,6 +83,19 @@ def test_dangerous_features_are_off_by_default():
     assert config.RECORD_SECONDS >= 1
 
 
+def test_env_bool_parsing(monkeypatch):
+    monkeypatch.setenv("FLAG_X", "true")
+    assert config._env_bool("FLAG_X") is True
+    monkeypatch.setenv("FLAG_X", "True")
+    assert config._env_bool("FLAG_X") is True
+    monkeypatch.setenv("FLAG_X", "false")
+    assert config._env_bool("FLAG_X") is False
+    monkeypatch.setenv("FLAG_X", "1")
+    assert config._env_bool("FLAG_X") is False  # только слово true
+    monkeypatch.delenv("FLAG_X")
+    assert config._env_bool("FLAG_X") is False
+
+
 def test_parse_point_accepts_common_formats():
     assert _parse_point("640,480") == (640, 480)
     assert _parse_point(" 640 ; 480 ") == (640, 480)

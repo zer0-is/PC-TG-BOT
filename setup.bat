@@ -20,6 +20,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt || (echo Не удалось установить библиотеки & pause & exit /b 1)
+".venv\Scripts\python.exe" -m pip install -r requirements-panel.txt || (echo Не удалось установить библиотеки панели & pause & exit /b 1)
 echo.
 echo Готово! Открываю панель управления...
 start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0control_panel.py"

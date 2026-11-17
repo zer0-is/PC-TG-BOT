@@ -19,6 +19,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
+"%PY%" -m pip install -r requirements-panel.txt
+if errorlevel 1 (
+  echo Не удалось установить зависимости панели.
+  pause
+  exit /b 1
+)
+
 "%PY%" -m pip install pyinstaller
 if errorlevel 1 (
   echo Не удалось установить PyInstaller.
@@ -27,7 +34,7 @@ if errorlevel 1 (
 )
 
 "%PY%" -m PyInstaller --noconfirm --onefile --noconsole --name PCBot ^
-  --collect-data customtkinter ^
+  --hidden-import pystray._win32 ^
   --distpath "%~dp0releases" ^
   --workpath "%~dp0build\work" ^
   --specpath "%~dp0build" ^

@@ -14,6 +14,10 @@ os.environ["BOT_TOKEN"] = "123456:AAHtest-token-for-unit-tests"
 os.environ["ALLOWED_USER_IDS"] = "111111, 222222"
 os.environ["ALLOW_SHELL"] = "false"
 os.environ["ALLOW_FILES"] = "false"
+# Опасные флаги фиксируем выключенными: в живом .env они могут быть
+# включены, но тесты проверяют поведение по умолчанию.
+os.environ["ALLOW_INPUT"] = "false"
+os.environ["ALLOW_AUDIO"] = "false"
 os.environ["SIGNING_KEY"] = "test-signing-key"
 os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["RATE_LIMIT"] = "20"
