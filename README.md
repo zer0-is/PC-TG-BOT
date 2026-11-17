@@ -111,6 +111,18 @@ Telegram ID в списке разрешённых пользователей. �
 Папка `releases/` исключена из git: готовые сборки публикуются в
 [GitHub Releases](https://github.com/zer0-is/PC-TG-BOT/releases).
 
+## CI и релизы
+
+GitHub Actions запускается на каждом пуше: ruff, mypy и pytest на
+Windows-раннере (`.github/workflows/ci.yml`). Чтобы выпустить сборку,
+создайте тег и отправьте его в репозиторий — workflow соберёт `PCBot.exe`,
+прогонит тесты и приложит файл к релизу:
+
+```bat
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 ## Панель и логи
 
 - Кнопка закрытия окна скрывает панель в трей; бот продолжает работать.
@@ -164,12 +176,13 @@ pcbot/                     Логика бота
   ai.py                    Запросы к OpenRouter
   app.py                   Регистрация обработчиков и запуск
   handlers/                Обработчики Telegram по темам
-control_panel.py           Графическая панель Windows
+control_panel.py           Панель Windows на PySide6
 requirements.txt           Зависимости бота
 requirements-panel.txt     Зависимости панели на Qt
 requirements-dev.txt       Тесты и линтеры
 setup.bat                  Подготовка окружения и запуск панели
 build_exe.bat              Сборка Windows EXE
+.github/workflows/         CI и автосборка релизов
 tests/                     Автотесты
 pyproject.toml             Настройки pytest, ruff и mypy
 .env.example               Шаблон без секретов

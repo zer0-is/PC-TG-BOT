@@ -1,0 +1,52 @@
+# Сборка EXE и публикация в GitHub Releases.
+# Запускается пушем тега вида v1.2.0. EXE в git не хранится.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-panel.txt
+          python -m pip install pyinstaller
+
+      - name: Тесты перед сборкой
+        run: python -m pytest
+        env:
+          BOT_TOKEN: "123456:AAHci-dummy-token"
+          ALLOWED_USER_IDS: "111111, 222222"
+          SIGNING_KEY: "ci-signing-key"
+          RATE_LIMIT: "20"
+
+      - name: Сборка PCBot.exe
+        run: >
+          python -m PyInstaller --noconfirm --onefile --noconsole --name PCBot
+          --hidden-import pystray._win32
+          --distpath dist
+          --workpath build\work
+          --specpath build
+          control_panel.py
+
+      - name: Публикация релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PCBot.exe
+          generate_release_notes: true
