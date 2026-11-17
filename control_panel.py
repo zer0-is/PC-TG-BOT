@@ -34,6 +34,11 @@ ENV_DEFAULTS = {
     "OPENROUTER_MODEL": "inclusionai/ling-3.2-flash:free",
     "ALLOW_SHELL": "false",
     "ALLOW_FILES": "false",
+    # Удалённый ввод (мышь и клавиатура) и запись экрана/микрофона.
+    "ALLOW_INPUT": "false",
+    "ALLOW_AUDIO": "false",
+    # Сколько секунд писать по умолчанию.
+    "RECORD_SECONDS": "10",
     "POWER_DELAY": "25",
     # Ключ подписи кнопок. Пусто — бот выводит его из токена.
     "SIGNING_KEY": "",
@@ -625,6 +630,8 @@ class ControlPanel:
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(13, 6))
         self.allow_shell = tk.BooleanVar(master=self.root, value=False)
         self.allow_files = tk.BooleanVar(master=self.root, value=False)
+        self.allow_input = tk.BooleanVar(master=self.root, value=False)
+        self.allow_audio = tk.BooleanVar(master=self.root, value=False)
         checkbox_style = {
             "text_color": "#E4E4E4",
             "fg_color": "#777777",
@@ -646,13 +653,25 @@ class ControlPanel:
             variable=self.allow_files,
             **checkbox_style,
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=3)
+        ctk.CTkCheckBox(
+            advanced,
+            text="Разрешить удалённый ввод: мышь и клавиатура",
+            variable=self.allow_input,
+            **checkbox_style,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=3)
+        ctk.CTkCheckBox(
+            advanced,
+            text="Разрешить запись экрана и микрофона",
+            variable=self.allow_audio,
+            **checkbox_style,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=18, pady=3)
         ctk.CTkLabel(
             advanced,
             text="Задержка выключения, секунд",
             text_color="#E4E4E4",
             font=("Segoe UI", 10),
             anchor="w",
-        ).grid(row=3, column=0, sticky="w", padx=(18, 14), pady=5)
+        ).grid(row=5, column=0, sticky="w", padx=(18, 14), pady=5)
         ctk.CTkEntry(
             advanced,
             textvariable=self.env_vars["POWER_DELAY"],
@@ -663,14 +682,32 @@ class ControlPanel:
             height=34,
             width=130,
             font=("Segoe UI", 10),
-        ).grid(row=3, column=1, sticky="w", padx=(0, 18), pady=5)
+        ).grid(row=5, column=1, sticky="w", padx=(0, 18), pady=5)
+        ctk.CTkLabel(
+            advanced,
+            text="Длительность записи, секунд",
+            text_color="#E4E4E4",
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).grid(row=6, column=0, sticky="w", padx=(18, 14), pady=5)
+        ctk.CTkEntry(
+            advanced,
+            textvariable=self.env_vars["RECORD_SECONDS"],
+            fg_color="#202020",
+            border_color="#686868",
+            text_color="#F1F1F1",
+            corner_radius=15,
+            height=34,
+            width=130,
+            font=("Segoe UI", 10),
+        ).grid(row=6, column=1, sticky="w", padx=(0, 18), pady=5)
         ctk.CTkLabel(
             advanced,
             text="Лимит команд в минуту",
             text_color="#E4E4E4",
             font=("Segoe UI", 10),
             anchor="w",
-        ).grid(row=4, column=0, sticky="w", padx=(18, 14), pady=5)
+        ).grid(row=7, column=0, sticky="w", padx=(18, 14), pady=5)
         ctk.CTkEntry(
             advanced,
             textvariable=self.env_vars["RATE_LIMIT"],
@@ -681,14 +718,14 @@ class ControlPanel:
             height=34,
             width=130,
             font=("Segoe UI", 10),
-        ).grid(row=4, column=1, sticky="w", padx=(0, 18), pady=5)
+        ).grid(row=7, column=1, sticky="w", padx=(0, 18), pady=5)
         ctk.CTkLabel(
             advanced,
             text="Ключ подписи кнопок",
             text_color="#E4E4E4",
             font=("Segoe UI", 10),
             anchor="w",
-        ).grid(row=5, column=0, sticky="w", padx=(18, 14), pady=5)
+        ).grid(row=8, column=0, sticky="w", padx=(18, 14), pady=5)
         signing_entry = ctk.CTkEntry(
             advanced,
             textvariable=self.env_vars["SIGNING_KEY"],
@@ -699,11 +736,11 @@ class ControlPanel:
             height=34,
             font=("Segoe UI", 10),
         )
-        signing_entry.grid(row=5, column=1, sticky="ew", padx=(0, 18), pady=5)
+        signing_entry.grid(row=8, column=1, sticky="ew", padx=(0, 18), pady=5)
         self.secret_entries.append(signing_entry)
         ctk.CTkLabel(
             advanced,
-            text="Команды и доступ к файлам дают боту расширенный доступ к компьютеру. "
+            text="Команды, файлы, ввод и запись дают боту расширенный доступ к компьютеру. "
             "Оставляй их выключенными, если они не нужны. "
             "Ключ подписи защищает кнопки от подделки — если оставить поле пустым, "
             "бот выведет его из токена.",
@@ -712,7 +749,7 @@ class ControlPanel:
             wraplength=780,
             justify="left",
             anchor="w",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=18, pady=(7, 13))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=18, pady=(7, 13))
 
         actions = ctk.CTkFrame(
             self.settings_content, fg_color="transparent", corner_radius=0
@@ -770,11 +807,16 @@ class ControlPanel:
             self.notebook.set("API / .ENV")
             return
 
+        checkbox_vars = {
+            "ALLOW_SHELL": self.allow_shell,
+            "ALLOW_FILES": self.allow_files,
+            "ALLOW_INPUT": self.allow_input,
+            "ALLOW_AUDIO": self.allow_audio,
+        }
         for key, default in ENV_DEFAULTS.items():
             value = values.get(key, default)
-            if key in ("ALLOW_SHELL", "ALLOW_FILES"):
-                variable = self.allow_shell if key == "ALLOW_SHELL" else self.allow_files
-                variable.set(value.strip().lower() in ("1", "true", "yes", "on"))
+            if key in checkbox_vars:
+                checkbox_vars[key].set(value.strip().lower() in ("1", "true", "yes", "on"))
             else:
                 self.env_vars[key].set(value)
 
@@ -832,6 +874,14 @@ class ControlPanel:
                 parent=self.root,
             )
             return
+        record_text = self.env_vars["RECORD_SECONDS"].get().strip()
+        if not record_text.isdecimal() or not 1 <= int(record_text) <= 120:
+            messagebox.showerror(
+                "Настройки",
+                "Длительность записи — целое число секунд от 1 до 120.",
+                parent=self.root,
+            )
+            return
 
         values = {
             "BOT_TOKEN": token,
@@ -840,6 +890,9 @@ class ControlPanel:
             "OPENROUTER_MODEL": model,
             "ALLOW_SHELL": str(self.allow_shell.get()).lower(),
             "ALLOW_FILES": str(self.allow_files.get()).lower(),
+            "ALLOW_INPUT": str(self.allow_input.get()).lower(),
+            "ALLOW_AUDIO": str(self.allow_audio.get()).lower(),
+            "RECORD_SECONDS": record_text,
             "POWER_DELAY": delay_text,
             "SIGNING_KEY": self.env_vars["SIGNING_KEY"].get().strip(),
             "RATE_LIMIT": rate_text,

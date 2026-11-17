@@ -5,7 +5,7 @@ import math
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .config import ALLOW_FILES, ALLOW_SHELL
+from .config import ALLOW_AUDIO, ALLOW_FILES, ALLOW_INPUT, ALLOW_SHELL, RECORD_SECONDS
 from .processes import format_rows
 from .security import sign_data
 from .windows_api import APPS, SITES, TG_LINKS
@@ -27,16 +27,86 @@ BACK = b(text="⬅️ В меню", callback_data="menu")
 
 
 def main_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [b(text="📸 Скриншот", callback_data="screenshot"),
+         b(text="📷 Веб-камера", callback_data="webcam")],
+        [b(text="📊 Состояние ПК", callback_data="stats"),
+         b(text="📋 Процессы", callback_data="procs")],
+        [b(text="🖥 Монитор и окна", callback_data="mon"),
+         b(text="🎛 Управление", callback_data="ctl")],
+        [b(text="📁 Файлы", callback_data="files"),
+         b(text="🚀 Программы", callback_data="apps")],
+        [b(text="💬 Сообщение", callback_data="msg"),
+         b(text="📎 Буфер обмена", callback_data="clip")],
+        [b(text="🎵 Звук и музыка", callback_data="sound"),
+         b(text="⏲ Таймер", callback_data="timer")],
+    ]
+    if ALLOW_AUDIO:
+        rows.append([b(text="🎬 Запись экрана", callback_data="rec")])
+    rows.append([b(text="🔒 Заблокировать", callback_data="ask:lock"),
+                 b(text="😴 Спящий режим", callback_data="ask:sleep")])
+    rows.append([b(text="🔄 Перезагрузить", callback_data="ask:reboot"),
+                 b(text="⏻ Выключить", callback_data="ask:shutdown")])
+    if ALLOW_SHELL:
+        rows.append([b(text="⚠️ Закрыть все процессы", callback_data="closeall")])
+    rows.append([b(text="♻️ Перезапустить бота", callback_data="restart_ask")])
+    return kb(rows)
+
+
+def monitor_menu() -> InlineKeyboardMarkup:
     return kb([
-        [b(text="📸 Скриншот", callback_data="screenshot"), b(text="📷 Веб-камера", callback_data="webcam")],
-        [b(text="📊 Состояние ПК", callback_data="stats"), b(text="📋 Процессы", callback_data="procs")],
-        [b(text="🎵 Звук и музыка", callback_data="sound"), b(text="🚀 Программы", callback_data="apps")],
-        [b(text="💬 Сообщение на экран", callback_data="msg"), b(text="📎 Буфер обмена", callback_data="clip")],
-        [b(text="⏲ Таймер выключения", callback_data="timer"), b(text="⚠️ Закрыть все процессы", callback_data="closeall")],
-        [b(text="🔒 Заблокировать", callback_data="ask:lock"), b(text="😴 Спящий режим", callback_data="ask:sleep")],
-        [b(text="🔄 Перезагрузить", callback_data="ask:reboot"), b(text="⏻ Выключить", callback_data="ask:shutdown")],
-        [b(text="♻️ Перезапустить бота", callback_data="restart_ask")],
+        [b(text="🪟 Окна", callback_data="wl"), b(text="🌐 Сеть", callback_data="net")],
+        [b(text="🔌 Автозапуск", callback_data="startup"),
+         b(text="📦 Программы", callback_data="installed")],
+        [b(text="🛠 Службы", callback_data="services"),
+         b(text="🖥 Состояние ПК", callback_data="stats")],
+        [BACK],
     ])
+
+
+def control_menu() -> InlineKeyboardMarkup:
+    rows = [
+        [b(text="🔉 Тише", callback_data="vol:-1"),
+         b(text="🔇 Mute", callback_data="mute"),
+         b(text="🔊 Громче", callback_data="vol:1")],
+        [b(text="🔅 Темнее", callback_data="br:-10"),
+         b(text="🔆 Ярче", callback_data="br:10")],
+        [b(text="🌙 Погасить экран", callback_data="monoff"),
+         b(text="🖼 Сменить обои", callback_data="wallpaper")],
+        [b(text="🗑 Очистить корзину", callback_data="recycl"),
+         b(text="🌐 Сбросить DNS", callback_data="flushdns")],
+        [b(text="🎵 Мультимедиа", callback_data="sound"),
+         b(text="⚙️ Параметры Windows", callback_data="settings")],
+    ]
+    if ALLOW_INPUT:
+        rows.append([b(text="🖱 Мышь и клавиатура", callback_data="input")])
+    rows.append([BACK])
+    return kb(rows)
+
+
+def input_menu() -> InlineKeyboardMarkup:
+    return kb([
+        [b(text="🖱 Левый клик", callback_data="inp:click:left"),
+         b(text="🖱 Правый клик", callback_data="inp:click:right")],
+        [b(text="⬆️ Прокрутить вверх", callback_data="inp:scroll:1"),
+         b(text="⬇️ Прокрутить вниз", callback_data="inp:scroll:-1")],
+        [b(text="⌨️ Напечатать текст", callback_data="inp:type"),
+         b(text="🎯 Клик по координатам", callback_data="inp:pos")],
+        [b(text="⌨️ Сочетание клавиш", callback_data="inp:combo"),
+         b(text="🎯 Где курсор", callback_data="inp:where")],
+        [b(text="⬅️ Управление", callback_data="ctl"), BACK],
+    ])
+
+
+def recording_menu() -> InlineKeyboardMarkup:
+    return kb([
+        [b(text=f"🎬 Экран {RECORD_SECONDS} с", callback_data="rec:screen"),
+         b(text=f"🎙 Микрофон {RECORD_SECONDS} с", callback_data="rec:mic")],
+        [b(text="🎬 Экран 30 с", callback_data="rec:screen30"),
+         b(text="🎙 Микрофон 30 с", callback_data="rec:mic30")],
+        [BACK],
+    ])
+
 
 
 def detail_menu(refresh_callback: str) -> InlineKeyboardMarkup:

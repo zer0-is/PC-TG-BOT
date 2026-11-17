@@ -19,6 +19,18 @@ load_dotenv(BASE_DIR / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pcbot")
 
+
+def _env_int(name: str, default: int) -> int:
+    """Читает целое из окружения, молча возвращая значение по умолчанию."""
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw.isdecimal() else default
+
+
+def _env_bool(name: str) -> bool:
+    """Флаг включён только словом true (1/yes не считаются, чтобы не угадывать)."""
+    return os.getenv(name, "false").strip().lower() == "true"
+
+
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 
@@ -33,6 +45,13 @@ ALLOW_SHELL = os.getenv("ALLOW_SHELL", "false").lower() == "true"
 ALLOW_FILES = os.getenv("ALLOW_FILES", "false").lower() == "true"
 
 
+# Удалённый ввод (мышь и клавиатура) и запись экрана/микрофона.
+ALLOW_INPUT = _env_bool("ALLOW_INPUT")
+ALLOW_AUDIO = _env_bool("ALLOW_AUDIO")
+# Сколько секунд писать по умолчанию, если не указано иное.
+RECORD_SECONDS = _env_int("RECORD_SECONDS", 10)
+
+
 POWER_DELAY = int(os.getenv("POWER_DELAY", "25"))  # секунд до выполнения действия
 
 
@@ -42,12 +61,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL", "inclusionai/ling-3.2-flash:free"
 ).strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    """Читает целое из окружения, молча возвращая значение по умолчанию."""
-    raw = os.getenv(name, "").strip()
-    return int(raw) if raw.isdecimal() else default
 
 
 SIGNING_KEY = os.getenv("SIGNING_KEY", "").strip() or hashlib.sha256(

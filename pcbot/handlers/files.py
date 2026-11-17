@@ -12,6 +12,8 @@ from aiogram.types import Message
 
 from ..config import DOWNLOADS
 from ..handlers.clipboard import popup_and_report
+from ..handlers.files_mgr import run_search
+from ..handlers.input import run_click_pos, run_combo, run_input_text
 from ..runtime import bot, dp, in_background, waiting_input
 from ..ui import main_menu
 from ..windows_api import clipboard_set
@@ -78,5 +80,13 @@ async def on_text(m: Message):
                            reply_markup=main_menu())
         except Exception as e:  # noqa: BLE001
             await m.answer(f"Не получилось записать в буфер: {e}")
+    elif mode == "input_text":
+        await run_input_text(m, text)
+    elif mode == "click_pos":
+        await run_click_pos(m, text)
+    elif mode == "combo":
+        await run_combo(m, text)
+    elif mode == "search":
+        await run_search(m, text)
     else:
         await m.answer("Не понял 🤔 Выбери действие в меню:", reply_markup=main_menu())
